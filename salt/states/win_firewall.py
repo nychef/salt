@@ -89,7 +89,68 @@ def disabled(name="allprofiles"):
     return ret
 
 
-def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip="any"):
+def delete_rule(name=None, rule_name=None, group=None, localport=None, protocol=None, dir=None, remoteip=None, log_only=False):
+    """
+    Delete an existing firewall rule identified by name and optionally by ports,
+    protocols, direction, and remote IP.
+
+    Args:
+
+        rule_name (str):
+            The name of the rule to delete. If the name ``all`` is used, you
+            must specify additional parameters. Cannot be used with group.
+
+        group (str):
+            The group name of the rule to delete. Cannot be used with name.
+
+        localport (:obj:`str`, optional):
+            The port of the rule. If protocol is not specified, protocol will be
+            set to ``tcp``. Default is ``None``.
+
+        protocol (:obj:`str`, optional):
+            The protocol of the rule. Default is ``tcp`` when ``localport`` is
+            specified. Default is ``None``.
+
+        dir (:obj:`str`, optional):
+            The direction of the rule. Default is ``None``.
+
+        remoteip (:obj:`str`, optional):
+            The remote IP of the rule. Default is ``None``.
+
+    Example:
+
+    .. code-block:: yaml
+
+        delete_smb_port:
+          win_firewall.delete_rule:
+            - name: SMB (445)
+    """
+    ret = {"name": name, "result": True, "changes": {}, "comment": ""}
+
+    # Check if rule exists
+    if __salt__["firewall.rule_exists"]( rule_name if rule_name else group ):
+        ret["changes"] = {"deleted rule": rule_name if rule_name else group}
+
+    if __opts__["test"] or log_only:
+        ret["result"] = not ret["changes"] or None
+        ret["comment"] = ret["changes"]
+        ret["changes"] = {}
+        return ret
+
+    # Add rule
+    try:
+        __salt__["firewall.delete_rule"](rule_name, group, localport, protocol, dir, remoteip)
+        ret["changes"] = {"deleted rule": name}
+    except CommandExecutionError as err:
+        ret["changes"] = {}
+        ret["result"] = False
+        ret["comment"] = f"Could not delete rule {rule_name}, {group}: {err}"
+        ret["error"] = f"{err}"
+
+    return ret
+
+
+def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip="any", remoteport="any", program=None, service=None):
     """
     Add a new inbound or outbound rule to the firewall policy
 
@@ -136,6 +197,17 @@ def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip
 
             Can be combinations of the above separated by commas.
 
+        program (Optional [str]): The full path to an executable. Examples are:
+        
+            - %systemroot%\\system32\\svchost.exe
+            - c:\\progam files\\application\\binary.exe
+
+        service (Optional [str]): The shortname of a service. Examples are:
+        
+            - eventlog
+            - rpcss
+
+
             .. versionadded:: 2016.11.6
 
     Example:
@@ -166,8 +238,10 @@ def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip
 
     # Add rule
     try:
-        __salt__["firewall.add_rule"](name, localport, protocol, action, dir, remoteip)
+        __salt__["firewall.add_rule"](name, localport, protocol, action, dir, remoteip, remoteport, program, service)
     except CommandExecutionError:
+        ret["result"] = False
+        ret["changes"] = {}
         ret["comment"] = "Could not add rule"
 
     return ret
@@ -235,6 +309,7 @@ def enabled(name="allprofiles"):
         try:
             ret["result"] = __salt__["firewall.enable"](name)
         except CommandExecutionError:
+            ret["result"]: False
             ret["comment"] = "Firewall Profile {} could not be enabled".format(
                 profile_map[name]
             )
@@ -246,3 +321,82 @@ def enabled(name="allprofiles"):
         ret["comment"] = msg
 
     return ret
+
+def set_setting(profile,  store="local", **settings):
+    ret = {"result": True, "changes": {}, "comment": "", 'name': ""}
+    settings_map = {
+        "inbound": "Inbound",
+        "outbound": "Outbound",
+        "allowedconnections": "LogAllowedConnections",
+        "droppedconnections": "LogDroppedConnections",
+        "filename": "FileName",
+        "maxfilesize": "MaxFileSize",
+        "localfirewallrules": "LocalFirewallRules",
+        "localconsecrules": "LocalConSecRules",
+        "inboundusernotification": "InboundUserNotification",
+        "unicastresponsetomulticast": "UnicastResponseToMulticast",
+        "on": "On",
+        "state": "State"
+    }
+
+    section_map = {
+        "inbound": "firewallpolicy",
+        "outbound": "firewallpolicy",
+        "allowedconnections": "firewallpolicy", 
+        "droppedconnections": "firewallpolicy",
+        "filename": "logging",
+        "maxfilesize": "logging",
+        "allowedconnections": "logging", 
+        "droppedconnections": "logging", 
+        "localfirewallrules": "settings", 
+        "localconsecrules": "settings", 
+        "inboundusernotification": "settings", 
+        "unicastresponsetomulticast": "settings",
+        "state": "state"
+    }
+
+    firewall_map = {
+        "state": "firewall.set_state",
+        "firewallpolicy": "firewall.set_firewall_settings",
+        "logging": "firewall.set_logging_settings",
+        "settings": "firewall.set_settings"
+    }
+
+    updates = {}
+    try:
+        current_settings = __salt__["firewall.get_all_settings"](profile)
+    except CommandExecutionError:
+        ret["comment"] = f"Firewall Profile {profile} could not be loaded"
+        return ret
+
+    for setting, value in settings['settings'].items():
+        section = section_map[setting]
+        if str(value).lower() != current_settings[settings_map[setting]].lower():
+            if section not in updates:
+                updates[section] = {}
+            updates[section][setting] = value
+            ret["changes"][f"{section}-{setting}"] = f"{current_settings[settings_map[setting]]} -> {value}"
+
+    for section, settings in updates.items():
+        if section == 'state':
+            if 'state' not in settings:
+                ret['error'] = "Missing required argument: state"
+            else:
+                res = __salt__[firewall_map[section]](profile, settings['state'], store)
+                ret['comment'] += f"{section}: {res}\n"
+        if section == 'firewallpolicy':
+            if 'inbound' not in settings and 'outbound' not in settings:
+                ret['error'] = "Missing required argument: [inbound|outbound]"
+            else:
+                for key in ['outbound', 'inbound']:
+                    if key not in settings:
+                        settings[key] = None
+            res = __salt__[firewall_map[section]](profile, settings['inbound'], settings['outbound'], store)
+            ret['comment'] += f"{section}: {res}\n"
+        if section in ["logging", "settings"]:
+            for setting,value in settings.items():
+                res = __salt__[firewall_map[section]](profile, setting, value, store)
+                ret['comment'] += f"{section} - {setting}: {res}\n"
+
+    return ret
+

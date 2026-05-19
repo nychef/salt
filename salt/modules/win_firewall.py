@@ -2,7 +2,8 @@
 Module for configuring Windows Firewall using ``netsh``
 """
 
-import re
+import logging, json, re
+
 
 import salt.utils.platform
 import salt.utils.win_lgpo_netsh
@@ -11,6 +12,7 @@ from salt.exceptions import CommandExecutionError
 # Define the module's virtual name
 __virtualname__ = "firewall"
 
+log = logging.getLogger(__name__)
 
 def __virtual__():
     """
@@ -44,7 +46,7 @@ def get_config():
     cmd = ["netsh", "advfirewall", "show", "allprofiles"]
     ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
 
     # There may be some problems with this depending on how `netsh` is localized
     # It's looking for lines that contain `Profile Settings` or start with
@@ -92,7 +94,7 @@ def disable(profile="allprofiles"):
     cmd = ["netsh", "advfirewall", "set", profile, "state", "off"]
     ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
 
     return True
 
@@ -129,12 +131,11 @@ def enable(profile="allprofiles"):
     cmd = ["netsh", "advfirewall", "set", profile, "state", "on"]
     ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
-
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
     return True
 
 
-def get_rule(name="all"):
+def get_rule(name='all'):
     """
     .. versionadded:: 2015.5.0
 
@@ -158,15 +159,47 @@ def get_rule(name="all"):
 
         salt '*' firewall.get_rule 'MyAppPort'
     """
-    cmd = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"]
-    ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
+    cmd = """$ErrorActionPreference = 'Stop'
+             $res = @()
+             try{
+               Get-NetFirewallRule"""
+
+    if name != 'all':
+        cmd += f" -DisplayName '{name}'"
+    
+    cmd += """| %{
+              $_ | add-member -MemberType NoteProperty -Name "Program" -Value ""
+              if ($_.EdgeTraversalPolicy -eq "DeferToApp"){
+                  $_.program = ($_ | get-NetFirewallApplicationFilter).program
+              }
+              $res += "{`"Name`": `"$($_.Name)`", `"DisplayName`": `"$($_.DisplayName)`", `"Description`": `"$($_.Description)`"," + 
+                 "`"DisplayGroup`": `"$($_.DisplayGroup)`", `"Enabled`": `"$($_.Enabled)`", `"Profile`": `"$($_.Profile)`"," + 
+                 "`"Direction`": `"$($_.Direction)`", `"Action`": `"$($_.Action)`", `"EdgePolicy`": `"$($_.EdgeTraversalPolicy)`"," + 
+                 "`"Program`": `"$($_.Program)`"}"}
+              write-host "[$($res -join ",`r`n")]"
+              exit 0
+            }
+            catch {
+              write-host $_.Exception.Message
+              exit -1
+            }
+    """
+    
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True, shell='powershell')
+
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
 
-    return {name: ret["stdout"]}
+    try:
+        ret[name] = json.loads(ret['stdout'].replace("\\","\\\\"))
+        ret['stdout'] = ""
+    except Exception as e:
+        ret['error'] = f"Error deserializing result: {e}"
+
+    return ret
 
 
-def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip="any"):
+def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip="any", remoteport="any", program=None, service=None):
     """
     .. versionadded:: 2015.5.0
 
@@ -221,6 +254,21 @@ def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip
 
             Can be combinations of the above separated by commas.
 
+        remoteport (:obj:`str`, optional):
+            The port the rule applies to. Must be a number between 0 and 65535.
+            Can be a range. Can specify multiple ports separated by commas.
+            Required.
+
+        program (Optional [str]): The full path to an executable. Examples are:
+
+            - %systemroot%\\system32\\svchost.exe
+            - c:\progam files\\application\\binary.exe
+
+        service (Optional [str]): The shortname of a service. Examples are:
+
+            - eventlog
+            - rpcss
+
     Returns:
         bool: ``True`` if successful
 
@@ -250,15 +298,24 @@ def add_rule(name, localport, protocol="tcp", action="allow", dir="in", remoteip
 
     if protocol is None or ("icmpv4" not in protocol and "icmpv6" not in protocol):
         cmd.append(f"localport={localport}")
+        cmd.append(f"remoteport={remoteport}")
 
+    if program:
+        cmd.append(f"program={program}")
+
+    if service:
+        cmd.append(f"service={service}")
+
+    log.debug(f"running cmd: {' '.join(cmd)}")
     ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
+
 
     return True
 
 
-def delete_rule(name=None, localport=None, protocol=None, dir=None, remoteip=None):
+def delete_rule(name=None, group=None, localport=None, protocol=None, dir=None, remoteip=None):
     """
     .. versionadded:: 2015.8.0
 
@@ -269,7 +326,10 @@ def delete_rule(name=None, localport=None, protocol=None, dir=None, remoteip=Non
 
         name (str):
             The name of the rule to delete. If the name ``all`` is used, you
-            must specify additional parameters.
+            must specify additional parameters. Cannot be used with group.
+
+        group (str):
+            The group name of the rule to delete. Cannot be used with name.
 
         localport (:obj:`str`, optional):
             The port of the rule. If protocol is not specified, protocol will be
@@ -308,25 +368,22 @@ def delete_rule(name=None, localport=None, protocol=None, dir=None, remoteip=Non
         # Delete a rule called 'allow80':
         salt '*' firewall.delete_rule allow80
     """
-    cmd = ["netsh", "advfirewall", "firewall", "delete", "rule"]
+    cmd = "Remove-NetFirewallRule"
+
+    if name and group:
+        raise CommandExecutionError(f"name ({name}) and group ({group}) cannot both be specified")
+
     if name:
-        cmd.append(f"name={name}")
-    if protocol:
-        cmd.append(f"protocol={protocol}")
+        cmd += f" -DisplayName '{name}'"
+    if group:
+        cmd += f" -DisplayGroup '{group}'"
     if dir:
-        cmd.append(f"dir={dir}")
-    if remoteip:
-        cmd.append(f"remoteip={remoteip}")
+        cmd += f" -Direction '{dir}'"
 
-    if protocol is None or ("icmpv4" not in protocol and "icmpv6" not in protocol):
-        if localport:
-            if not protocol:
-                cmd.append("protocol=tcp")
-            cmd.append(f"localport={localport}")
-
-    ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True)
+    log.debug(f"running cmd: {cmd}")
+    ret = __salt__["cmd.run_all"](cmd, python_shell=False, ignore_retcode=True, shell='powershell')
     if ret["retcode"] != 0:
-        raise CommandExecutionError(ret["stdout"])
+        raise CommandExecutionError(f"running {cmd} -> {ret['stdout']}")
 
     return True
 
